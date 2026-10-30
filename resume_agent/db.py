@@ -174,3 +174,17 @@ def get_employee_name(employee_id):
     ).fetchone()
     conn.close()
     return row["full_name"] if row else None
+
+# ---- paste at the END of resume_agent/db.py ----
+
+def get_employee_profile(employee_id):
+    """Profile fields used as Chroma chunk metadata (None if the employee is unknown)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    row = cur.execute(
+        "SELECT full_name, department, designation, manager_id "
+        "FROM employees WHERE employee_id = ?",
+        (employee_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None

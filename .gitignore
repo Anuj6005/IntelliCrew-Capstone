@@ -112,3 +112,8 @@ service_account.json
 # OS Generated
 # =====================================
 desktop.ini
+
+
+data/
+chroma_db/
+uploads/

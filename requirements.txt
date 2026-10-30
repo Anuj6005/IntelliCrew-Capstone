@@ -27,3 +27,4 @@ transformers == 4.46.3
 torch
 youtube-transcript-api
 openai-whisper
+pytest
