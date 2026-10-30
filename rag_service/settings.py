@@ -39,7 +39,7 @@ def _boolean(env: Mapping[str, str], name: str, default: bool) -> bool:
 class RagSettings:
     """Runtime thresholds and limits, with defaults matching the original service."""
 
-    max_distance: float = 1.2
+    max_distance: float = 0.9275
     rerank: bool = True
     sql_max_rows: int = 200
     sql_time_limit_s: float = 5.0

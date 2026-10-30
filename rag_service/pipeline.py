@@ -8,8 +8,16 @@ from dataclasses import dataclass, field
 
 from .access import Principal, allowed_sources, ROLE_MANAGER
 from .retriever import search_resumes, group_by_employee
-from .sql_tool import ask_sql
-from .people import find_person, parse_name_query
+from .sql_tool import query_workforce
+from .people import (
+    find_own_manager,
+    find_person,
+    is_self_profile_query,
+    manager_of_query,
+    name_matches,
+    parse_name_query,
+    team_owner_query,
+)
 from .settings import SETTINGS
 
 MAX_HISTORY_TURNS = SETTINGS.history_turns
@@ -111,6 +119,11 @@ def _ids_from_sql(columns, rows):
     return {str(r[i]) for r in rows if r[i] is not None}
 
 
+def _employee_id_list(columns, rows):
+    ids = _ids_from_sql(columns, rows)
+    return sorted(ids) if ids is not None else []
+
+
 def _person_reply(matches: list, name: str, principal: Principal) -> str:
     """Minimal profile only: name, designation, contact, manager (no resume detail)."""
     if not matches:
@@ -131,9 +144,34 @@ def _person_reply(matches: list, name: str, principal: Principal) -> str:
             "\nGive me a full name or an employee id and I'll show their details.")
 
 
+def _manager_profile_reply(manager: dict) -> str:
+    return (f"**{manager['name']}** ({manager['manager_id']})\n"
+            f"- Email: {manager['email'] or 'not on file'}")
+
+
 def _not_found(principal: Principal) -> str:
     scope = "your team's records" if principal.role == ROLE_MANAGER else "the records"
     return f"I couldn't find anything in {scope} that matches that."
+
+
+def _availability_question(question: str) -> bool:
+    return bool(re.search(r"\b(available|availability|free|unallocated)\b",
+                          (question or "").lower()))
+
+
+def _availability_reply(sql_result) -> str:
+    """List structured matches without guessing their current project availability."""
+    columns = [column.lower() for column in sql_result.columns]
+    id_index = columns.index("employee_id")
+    name_index = columns.index("full_name")
+    designation_index = columns.index("designation") if "designation" in columns else None
+    lines = []
+    for row in sql_result.rows:
+        designation = (f" ({row[designation_index]})" if designation_index is not None
+                       and row[designation_index] else "")
+        lines.append(f"- {row[id_index]}, {row[name_index]}{designation}")
+    return ("I found these matching employees, but the records don't include current "
+            "project availability, so I can't confirm who is available:\n" + "\n".join(lines))
 
 
 def answer_question(question: str, principal: Principal, llm, history=None, *,
@@ -143,6 +181,30 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
     sources = allowed_sources(principal.role)
     if not sources:
         return RagAnswer(NO_ACCESS_REPLY, "denied")
+
+    if principal.role == ROLE_MANAGER and is_self_profile_query(question):
+        manager = find_own_manager(principal, **kw_db)
+        if manager:
+            return RagAnswer(_manager_profile_reply(manager), "person", question,
+                             [{"type": "sql", "query": "own manager profile", "rows": 1}])
+
+    manager_target = manager_of_query(question)
+    if manager_target:
+        matches = find_person(manager_target, principal, **kw_db)
+        if not matches:
+            scope = "your team's records" if principal.role == ROLE_MANAGER else "the records"
+            return RagAnswer(
+                f"I couldn't find anyone named '{manager_target}' in {scope}.",
+                "person", manager_target)
+        employee = matches[0]
+        if employee["manager_name"]:
+            answer = (f"**{employee['manager_name']}** ({employee['manager_id']}) is "
+                      f"the manager of {employee['name']} ({employee['employee_id']}).")
+        else:
+            answer = f"{employee['name']} ({employee['employee_id']}) has no manager assigned."
+        return RagAnswer(answer, "person", manager_target,
+                         [{"type": "sql", "query": "manager lookup", "rows": 1,
+                           "employee_ids": [employee["employee_id"]]}])
 
     # Fast path: a bare name / "who is X" is a profile lookup. No model call needed; if nobody
     # matches, fall through to normal routing (it may be a skills or counting question).
@@ -154,10 +216,23 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
                               fuzzy=explicit or len(candidate.split()) >= 2, **kw_db)
         if matches:
             return RagAnswer(_person_reply(matches, candidate, principal), "person", candidate,
-                             [{"type": "sql", "query": "person lookup", "rows": len(matches)}])
+                             [{"type": "sql", "query": "person lookup", "rows": len(matches),
+                               "employee_ids": [m["employee_id"] for m in matches]}])
+        if principal.role == ROLE_MANAGER:
+            manager = find_own_manager(principal, **kw_db)
+            if manager and name_matches(candidate, manager["name"]):
+                return RagAnswer(_manager_profile_reply(manager), "person", candidate,
+                                 [{"type": "sql", "query": "own manager profile", "rows": 1}])
 
     standalone, route, person_name = _parse_route(
         llm(ROUTER_PROMPT.format(history=_history_text(history), question=question)), question)
+    if principal.role == ROLE_MANAGER:
+        owner = team_owner_query(question)
+        if owner:
+            manager = find_own_manager(principal, **kw_db)
+            if not manager or not name_matches(owner, manager["name"]):
+                return RagAnswer("I can only access your own team's records.",
+                                 "denied", standalone)
     if route == "other":
         return RagAnswer(OTHER_REPLY, "other", standalone)
     if route == "person":
@@ -166,12 +241,18 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
         name = person_name or standalone
         matches = find_person(name, principal, **kw_db)
         return RagAnswer(_person_reply(matches, name, principal), "person", standalone,
-                         [{"type": "sql", "query": "person lookup", "rows": len(matches)}])
+                         [{"type": "sql", "query": "person lookup", "rows": len(matches),
+                           "employee_ids": [m["employee_id"] for m in matches]}])
 
     sql_result, hits, restrict = None, [], None
     if route in ("sql", "both") and "employee_db" in sources:
-        sql_result = ask_sql(standalone, principal, llm, history=_history_text(history)
-                             if history else "", **kw_db)
+        structured_question = question if route == "both" else standalone
+        sql_result = query_workforce(
+            structured_question, principal, include_skill=route != "both", **kw_db)
+        if (sql_result.error == "unsupported structured question" and
+                structured_question != question):
+            sql_result = query_workforce(question, principal,
+                                         include_skill=route != "both", **kw_db)
         if route == "both":
             if sql_result.rows:
                 restrict = _ids_from_sql(sql_result.columns, sql_result.rows)
@@ -184,6 +265,13 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
 
     evidence = group_by_employee(hits)
     has_sql = bool(sql_result and sql_result.rows)
+    if (has_sql and _availability_question(question) and
+            "employee_id" in [column.lower() for column in sql_result.columns]):
+        return RagAnswer(
+            _availability_reply(sql_result), route, standalone,
+            [{"type": "sql", "query": sql_result.sql, "rows": len(sql_result.rows),
+              "employee_ids": _employee_id_list(sql_result.columns, sql_result.rows)}],
+            sql=sql_result.sql)
     if not has_sql and not evidence:
         msg = _not_found(principal)
         if sql_result and sql_result.error and not hits:
@@ -208,7 +296,8 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
                                     context="\n\n".join(parts))).strip()
     srcs = []
     if has_sql:
-        srcs.append({"type": "sql", "query": sql_result.sql, "rows": len(sql_result.rows)})
+        srcs.append({"type": "sql", "query": sql_result.sql, "rows": len(sql_result.rows),
+                     "employee_ids": _employee_id_list(sql_result.columns, sql_result.rows)})
     for e in evidence:
         for h in e.hits:
             srcs.append({"type": "resume", "employee_id": e.employee_id, "name": e.name,

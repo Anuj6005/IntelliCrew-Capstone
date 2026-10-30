@@ -6,7 +6,7 @@ from rag_service.settings import RagSettings
 def test_settings_defaults_preserve_existing_limits():
     settings = RagSettings.from_env({})
 
-    assert settings.max_distance == 1.2
+    assert settings.max_distance == 0.9275
     assert settings.rerank is True
     assert settings.sql_max_rows == 200
     assert settings.sql_time_limit_s == 5.0

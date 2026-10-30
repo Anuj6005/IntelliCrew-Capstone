@@ -1,9 +1,10 @@
 """Basic profile lookup by name: no model-written SQL, minimal fields, team-scoped."""
 import re
+import sqlite3
 from difflib import SequenceMatcher
+from pathlib import Path
 
-from .access import DB_PATH, Principal
-from .sql_tool import build_sandbox
+from .access import DB_PATH, Principal, employee_scope
 
 MAX_MATCHES = 6
 FUZZY_MIN = 0.65       # per-token similarity needed to accept a typo'd name
@@ -55,6 +56,61 @@ def name_candidate(message: str):
     return parse_name_query(message)[0]
 
 
+def manager_of_query(message: str):
+    """Return the employee name in a direct 'who is X's manager?' question."""
+    match = re.search(
+        r"\b(?:who\s+is|who's)\s+(?:the\s+)?manager\s+(?:of|for)\s+(.+?)[?!.,]*$",
+        (message or "").strip(), re.I)
+    return match.group(1).strip() if match else None
+
+
+def team_owner_query(message: str):
+    """Return a named team owner, if a question explicitly names one."""
+    text = (message or "").strip()
+    match = re.search(r"\b(?:in|of|for|under)\s+(.+?)['’]s\s+team\b", text, re.I)
+    if match:
+        owner = match.group(1).strip()
+        if owner.lower() not in {"my", "our", "your", "their", "this", "the"}:
+            return owner
+    match = re.search(r"\b(?:reports?\s+to|reporting\s+to)\s+(.+?)[?!.,]*$", text, re.I)
+    if match and match.group(1).strip().lower() not in {"me", "you", "myself"}:
+        return match.group(1).strip()
+    return None
+
+
+def name_matches(candidate: str, full_name: str) -> bool:
+    """Allow modest spelling errors when checking a named owner against the session user."""
+    candidate_tokens = [t.lower() for t in re.findall(r"[\w'.-]+", candidate or "") if len(t) >= 3]
+    name_tokens = [t.lower() for t in re.findall(r"[\w'.-]+", full_name or "")]
+    return bool(candidate_tokens and name_tokens) and all(
+        max((SequenceMatcher(None, token, name).ratio() for name in name_tokens), default=0) >= FUZZY_MIN
+        for token in candidate_tokens)
+
+
+def find_own_manager(principal: Principal, db_path=DB_PATH):
+    """Return the signed-in manager's basic profile; never looks up another manager."""
+    if principal.role != "MANAGER":
+        return None
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT manager_id, full_name, email FROM manager WHERE manager_id = ?",
+            (principal.user_id,)).fetchone()
+        if not row:
+            return None
+        return {"manager_id": row[0], "name": row[1], "email": row[2]}
+    finally:
+        conn.close()
+
+
+def is_self_profile_query(message: str) -> bool:
+    """Recognize basic questions about the signed-in manager account."""
+    text = re.sub(r"[?!.,]+\s*$", "", (message or "").strip().lower())
+    return bool(re.fullmatch(
+        r"(?:who am i|what is my name|what's my name|my profile|show my profile|"
+        r"what is my email|what's my email|my email|my manager id)", text))
+
+
 def _esc(token: str) -> str:
     return token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
@@ -75,15 +131,22 @@ def find_person(name: str, principal: Principal, db_path=DB_PATH, limit: int = M
 
     base = ("SELECT e.employee_id, e.full_name, e.designation, e.department, e.email, "
             "e.manager_id, m.full_name FROM employees e "
-            "LEFT JOIN managers m ON m.manager_id = e.manager_id ")
-    mem = build_sandbox(principal, db_path)
+            "LEFT JOIN manager m ON m.manager_id = e.manager_id ")
+    scope, scope_params = employee_scope(principal)
+    if principal.role == "MANAGER":
+        scope = "e.manager_id = ?"
+    else:
+        scope = "1 = 1"
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
     try:
-        rows = mem.execute(base + f"WHERE {where} ORDER BY e.full_name LIMIT {int(limit)}",
-                           params).fetchall()
+        rows = conn.execute(base + f"WHERE ({scope}) AND ({where}) "
+                            "ORDER BY e.full_name LIMIT ?",
+                            [*scope_params, *params, int(limit)]).fetchall()
         if fuzzy and not rows and not re.fullmatch(r"[a-z]\d{2,}", text):    # typo tolerance
-            rows = _fuzzy(mem.execute(base).fetchall(), text, limit)
+            rows = _fuzzy(conn.execute(base + f"WHERE {scope}", scope_params).fetchall(),
+                          text, limit)
     finally:
-        mem.close()
+        conn.close()
     keys = ("employee_id", "name", "designation", "department", "email",
             "manager_id", "manager_name")
     return [dict(zip(keys, r)) for r in rows]

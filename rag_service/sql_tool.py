@@ -113,6 +113,82 @@ def run_query(mem: sqlite3.Connection, sql: str, max_rows: int = MAX_ROWS):
         mem.set_progress_handler(None, 0)
 
 
+def query_workforce(question: str, principal: Principal, db_path=DB_PATH, *,
+                    include_skill: bool = True) -> SqlResult:
+    """Run a small set of fixed, parameterized workforce queries.
+
+    This is the chatbot path: the question selects a supported query shape, while
+    values are always bound as parameters. The model never writes SQL here.
+    """
+    require_source(principal, "employee_db")
+    clause, params = employee_scope(principal)
+    if principal.role == "MANAGER":
+        clause = "e.manager_id = ?"
+    else:
+        clause = "1 = 1"
+
+    question = (question or "").lower()
+    team_query = principal.role == "MANAGER" and bool(re.search(
+        r"\b(team|direct reports?|reports? to|reporting to|under me)\b", question))
+    department_match = None if team_query else re.search(
+        r"\b(?:in|from)\s+(.+?)(?:\s+(?:department|dept)\b|[?!.,]*$)", question)
+    department = department_match.group(1).strip() if department_match else None
+    if department and re.search(r"\b(company|organization|team)\b", department):
+        department = None
+    skill_match = re.search(
+        r"\b(?:know|knows|knowing|have|has|with|using|skilled\s+in)\s+([\w+#.-]+)",
+        question)
+    skill = skill_match.group(1).strip() if skill_match and include_skill else None
+    designation_match = re.search(
+        r"\b((?:[a-z][\w+#.-]*\s+)?(?:developers?|engineers?|analysts?|interns?|"
+        r"designers?|scientists?|architects?|consultants?|specialists?|administrators?))\b",
+        question)
+    designation = designation_match.group(1) if designation_match else None
+    if designation:
+        designation = re.sub(r"\bdevelopers\b", "developer", designation)
+        designation = re.sub(r"\bengineers\b", "engineer", designation)
+        designation = re.sub(r"\banalysts\b", "analyst", designation)
+    count_query = bool(re.search(r"\b(how many|count|number of)\b", question))
+
+    if not count_query and not (department or skill or designation or team_query):
+        return SqlResult("", error="unsupported structured question")
+
+    if count_query:
+        sql = "SELECT COUNT(DISTINCT e.employee_id) AS employee_count FROM employees e"
+    else:
+        sql = ("SELECT DISTINCT e.employee_id, e.full_name, e.department, e.designation "
+               "FROM employees e")
+    query_params = list(params) if principal.role == "MANAGER" else []
+    where = [clause]
+    if department:
+        where.append("instr(LOWER(e.department), LOWER(?)) > 0")
+        query_params.append(department)
+    if skill:
+        sql += (" JOIN employee_skills es ON es.employee_id = e.employee_id "
+                "JOIN skills s ON s.skill_id = es.skill_id")
+        where.append("LOWER(s.skill_name) = LOWER(?)")
+        query_params.append(skill)
+    if designation:
+        where.append("instr(LOWER(e.designation), LOWER(?)) > 0")
+        query_params.append(designation)
+    sql += " WHERE " + " AND ".join(where)
+    if not count_query:
+        sql += " ORDER BY e.full_name LIMIT ?"
+        query_params.append(MAX_ROWS)
+
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
+    deadline = time.monotonic() + TIME_LIMIT_S
+    conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10000)
+    try:
+        cursor = conn.execute(sql, query_params)
+        return SqlResult(sql, [col[0] for col in cursor.description], cursor.fetchall())
+    except sqlite3.Error as error:
+        return SqlResult("", error=str(error))
+    finally:
+        conn.set_progress_handler(None, 0)
+        conn.close()
+
+
 def schema_doc(mem: sqlite3.Connection) -> str:
     """Schema text for the SQL prompt, built only from what this principal can see.
 

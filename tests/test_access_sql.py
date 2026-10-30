@@ -38,6 +38,26 @@ def test_scope_ids():
     assert sorted(scoped_employee_ids(M1, DB)) == ["E001", "E002"]
     assert scoped_employee_ids(M2, DB) == ["E003"]
 
+def test_fixed_workforce_queries_are_parameterized_and_team_scoped():
+    team_one = st.query_workforce("who knows Python", M1, DB)
+    team_two = st.query_workforce("who knows Python", M2, DB)
+    assert {row[0] for row in team_one.rows} == {"E001"}
+    assert {row[0] for row in team_two.rows} == {"E003"}
+
+    hostile_department = st.query_workforce("people in x' OR 1=1 -- dept", M1, DB)
+    assert hostile_department.rows == []
+    assert "OR 1=1" not in hostile_department.sql
+
+def test_team_and_designation_queries_use_the_signed_in_manager_scope():
+    team = st.query_workforce("who is in my team", M1, DB)
+    python_developers = st.query_workforce("python developer in my team", M1, DB)
+    company_wording = st.query_workforce("list python developers in the company", M1, DB)
+
+    assert {row[0] for row in team.rows} == {"E001", "E002"}
+    assert {row[0] for row in python_developers.rows} == {"E001"}
+    assert {row[0] for row in company_wording.rows} == {"E001"}
+    assert "designation" in python_developers.sql.lower()
+
 def test_row_scoping():
     assert len(q(HR, "SELECT * FROM employees")) == 3
     assert {r[0] for r in q(M1, "SELECT employee_id FROM employees")} == {"E001", "E002"}

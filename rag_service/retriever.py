@@ -7,9 +7,8 @@ from .settings import SETTINGS
 # Keep in sync with document_loader.doc_loader.CURRENT_ONLY (ingestion side).
 CURRENT_ONLY = {"is_current": True}
 
-# Distances come from Chroma's default (squared L2 on normalised MiniLM vectors).
-# 0.7-1.0 was a real match and 1.4+ was "nobody has this" on the first sample set;
-# re-calibrate with the eval set once there are more resumes.
+# Distances use Chroma's squared L2 on normalised MiniLM vectors. T3's synthetic
+# labeled MiniLM evaluation set recommended 0.9275; review again as the corpus grows.
 MAX_DISTANCE = SETTINGS.max_distance
 RERANK_DEFAULT = SETTINGS.rerank
 RERANK_MODEL = SETTINGS.rerank_model
