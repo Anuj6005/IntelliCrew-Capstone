@@ -141,3 +141,12 @@ def test_python310_compatible_authorizer():
     """set_authorizer(None) needs Python 3.11+; the project runs on 3.10."""
     import inspect
     assert "set_authorizer(None" not in inspect.getsource(st)
+
+
+def test_person_skill_template_enforces_manager_scope():
+    foreign = st.query_person_skills("E003", M1, db_path=DB)
+    own_team = st.query_person_skills("E003", M2, db_path=DB)
+
+    assert foreign.rows == []
+    assert own_team.rows and {row[0] for row in own_team.rows} == {"E003"}
+    assert "e.employee_id = ?" in own_team.sql

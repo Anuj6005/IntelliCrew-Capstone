@@ -59,7 +59,9 @@ def calibrate_cases(cases, vector_db, db_path, *, top_k=SETTINGS.top_k,
                     current_cutoff=SETTINGS.max_distance, recommend_cutoff=True):
     """Compute per-query relevant/irrelevant hits using only scoped current documents."""
     observations = []
+    person_observations = []
     relevant_distances, irrelevant_distances = [], []
+    person_relevant_distances = []
     for case in cases:
         if case["expected_route"] not in ("resumes", "both"):
             continue
@@ -67,9 +69,29 @@ def calibrate_cases(cases, vector_db, db_path, *, top_k=SETTINGS.top_k,
         allowed = visible_ids(principal, db_path=db_path)
         if allowed is not None and not allowed:
             continue
+        expected = set(case.get("expected_employee_ids", []))
+        person_scoped = bool(case.get("person_scoped"))
+        if person_scoped:
+            scoped = expected if allowed is None else expected & allowed
+            if not scoped:
+                continue
+            documents = vector_db.similarity_search_with_score(
+                case["question"], k=top_k,
+                filter=_build_filter(scoped if allowed is None else allowed & scoped))
+            per_employee = {}
+            for document, raw_distance in documents:
+                employee_id = str(document.metadata.get("employee_id", ""))
+                if employee_id not in scoped:
+                    continue
+                distance = float(raw_distance)
+                per_employee[employee_id] = min(per_employee.get(employee_id, distance), distance)
+                person_relevant_distances.append(distance)
+            person_observations.append({"id": case["id"],
+                                        "expected_employee_ids": sorted(scoped),
+                                        "employee_distances": per_employee})
+            continue
         documents = vector_db.similarity_search_with_score(
             case["question"], k=top_k, filter=_build_filter(allowed))
-        expected = set(case.get("expected_employee_ids", []))
         per_employee = {}
         for document, raw_distance in documents:
             employee_id = str(document.metadata.get("employee_id", ""))
@@ -105,6 +127,12 @@ def calibrate_cases(cases, vector_db, db_path, *, top_k=SETTINGS.top_k,
                    "expected_employee_ids": case["expected_employee_ids"],
                    "employee_distances": case["employee_distances"]}
                   for case in observations],
+        "person_scoped_calibration": {
+            "question_count": len(person_observations),
+            "relevant_hit_distances": _distribution(person_relevant_distances),
+            "distance_cutoff_used": False,
+            "cases": person_observations,
+        },
     }
 
 

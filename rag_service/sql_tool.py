@@ -189,6 +189,30 @@ def query_workforce(question: str, principal: Principal, db_path=DB_PATH, *,
         conn.close()
 
 
+def query_person_skills(employee_id: str, principal: Principal, db_path=DB_PATH) -> SqlResult:
+    """Read one employee's structured skills while enforcing the caller's scope."""
+    require_source(principal, "employee_db")
+    clause, params = employee_scope(principal)
+    if principal.role == "MANAGER":
+        clause = "e.manager_id = ?"
+    else:
+        clause = "1 = 1"
+    sql = ("SELECT e.employee_id, e.full_name, s.skill_name, es.proficiency_level, "
+           "es.years_experience FROM employees e "
+           "JOIN employee_skills es ON es.employee_id = e.employee_id "
+           "JOIN skills s ON s.skill_id = es.skill_id "
+           f"WHERE ({clause}) AND e.employee_id = ? ORDER BY s.skill_name LIMIT ?")
+    query_params = [*(params if principal.role == "MANAGER" else []), employee_id, MAX_ROWS]
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        cursor = conn.execute(sql, query_params)
+        return SqlResult(sql, [column[0] for column in cursor.description], cursor.fetchall())
+    except sqlite3.Error as error:
+        return SqlResult("", error=str(error))
+    finally:
+        conn.close()
+
+
 def schema_doc(mem: sqlite3.Connection) -> str:
     """Schema text for the SQL prompt, built only from what this principal can see.
 

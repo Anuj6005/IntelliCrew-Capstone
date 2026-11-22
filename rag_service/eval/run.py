@@ -131,6 +131,7 @@ def _evaluate_cases(cases, llm, fixture):
     route_correct = 0
     not_found_total = not_found_correct = 0
     scope_leaks = 0
+    gold_section_cases = gold_section_misses = 0
     latencies = []
 
     for case in cases:
@@ -147,6 +148,19 @@ def _evaluate_cases(cases, llm, fixture):
         actual_ids = _employee_ids(result)
         retrieved_ids = {str(source["employee_id"]) for source in result.sources
                          if source.get("type") == "resume" and source.get("employee_id")}
+        expected_sections = set(case.get("expected_sections", []))
+        returned_gold_sections = [source.get("section", "").lower()
+                                  for source in result.sources
+                                  if source.get("type") == "resume"
+                                  and source.get("employee_id") in expected_ids]
+        gold_section_found = (not expected_sections or
+                              bool(expected_sections & set(returned_gold_sections)))
+        gold_section_rank = next((item["rank"] for item in result.retrieval_debug
+                                  if item["employee_id"] in expected_ids
+                                  and item["section"].lower() in expected_sections), None)
+        if expected_sections:
+            gold_section_cases += 1
+            gold_section_misses += int(not gold_section_found)
         if case["expected_route"] in ("resumes", "both"):
             true_positive += len(retrieved_ids & expected_ids)
             false_positive += len(retrieved_ids - expected_ids)
@@ -166,6 +180,10 @@ def _evaluate_cases(cases, llm, fixture):
             "expected_employee_ids": sorted(expected_ids),
             "employee_ids": sorted(actual_ids),
             "retrieved_resume_ids": sorted(retrieved_ids),
+            "expected_sections": sorted(expected_sections),
+            "retrieved_gold_employee_sections": returned_gold_sections,
+            "gold_section_found": gold_section_found,
+            "gold_section_rank": gold_section_rank,
             "forbidden_employee_ids": sorted(forbidden_ids),
             "scope_leak_ids": sorted(leak_ids),
             "expect_not_found": bool(case.get("expect_not_found", False)),
@@ -185,6 +203,9 @@ def _evaluate_cases(cases, llm, fixture):
         "retrieval_employee_id_recall": recall,
         "not_found_accuracy": not_found_accuracy,
         "scope_leak_count": scope_leaks,
+        "gold_section_miss_count": gold_section_misses,
+        "gold_section_accuracy": ((gold_section_cases - gold_section_misses) /
+                                   float(gold_section_cases) if gold_section_cases else None),
         "average_latency_ms": statistics.mean(latencies) if latencies else 0.0,
         "p95_latency_ms": _p95(latencies),
     }
@@ -213,6 +234,7 @@ def _write_reports(report, output_dir, llm_mode, real_embeddings):
         (f"- Not-found accuracy: {metrics['not_found_accuracy']:.1%}"
          if metrics["not_found_accuracy"] is not None else "- Not-found accuracy: n/a"),
         f"- Scope leaks: {metrics['scope_leak_count']}",
+        f"- Gold section misses: {metrics['gold_section_miss_count']}",
         f"- Average latency: {metrics['average_latency_ms']:.2f} ms",
         f"- P95 latency: {metrics['p95_latency_ms']:.2f} ms", "",
         "| Case | Route (expected) | Expected IDs | Resume IDs | Not found | Leak IDs | Latency ms |",
@@ -224,6 +246,16 @@ def _write_reports(report, output_dir, llm_mode, real_embeddings):
             f"{', '.join(row['expected_employee_ids']) or '—'} | "
             f"{', '.join(row['retrieved_resume_ids']) or '—'} | {row['not_found']} | "
             f"{', '.join(row['scope_leak_ids']) or '—'} | {row['latency_ms']:.2f} |")
+    section_rows = [row for row in report["results"] if row["expected_sections"]]
+    if section_rows:
+        lines.extend(["", "## Person-scoped gold section ranks", "",
+                      "| Case | Gold section | Rank | In returned top 3 |",
+                      "|---|---|---:|---:|"])
+        for row in section_rows:
+            rank = row["gold_section_rank"]
+            lines.append(f"| {row['id']} | {', '.join(row['expected_sections'])} | "
+                         f"{rank if rank is not None else 'not found'} | "
+                         f"{row['gold_section_found']} |")
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return json_path, markdown_path
 
@@ -257,8 +289,15 @@ def main(argv=None):
     parser.add_argument("--output-dir", default=str(REPORT_DIR))
     args = parser.parse_args(argv)
     report = run_evaluation(args.llm, args.real_embeddings, args.output_dir)
-    print(json.dumps({"metrics": report["metrics"], "report_paths": report["report_paths"]}, indent=2))
-    return 1 if report["metrics"]["scope_leak_count"] else 0
+    output = {"metrics": report["metrics"], "report_paths": report["report_paths"]}
+    if args.real_embeddings:
+        output["person_scoped_section_ranks"] = [
+            {"id": row["id"], "gold_sections": row["expected_sections"],
+             "rank": row["gold_section_rank"]}
+            for row in report["results"] if row["expected_sections"]]
+    print(json.dumps(output, indent=2))
+    return 1 if (report["metrics"]["scope_leak_count"] or
+                 report["metrics"]["gold_section_miss_count"]) else 0
 
 
 if __name__ == "__main__":

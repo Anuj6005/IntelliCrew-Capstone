@@ -1,4 +1,5 @@
-"""Resume retrieval: scoped Chroma search -> distance cutoff -> rerank -> group per employee."""
+"""Resume retrieval: scope current Chroma chunks, optionally cut off, rerank and group."""
+import re
 from dataclasses import dataclass, field
 
 from .access import Principal, require_source, scoped_employee_ids, DB_PATH
@@ -7,8 +8,8 @@ from .settings import SETTINGS
 # Keep in sync with document_loader.doc_loader.CURRENT_ONLY (ingestion side).
 CURRENT_ONLY = {"is_current": True}
 
-# Distances use Chroma's squared L2 on normalised MiniLM vectors. T3's synthetic
-# labeled MiniLM evaluation set recommended 0.9275; review again as the corpus grows.
+# Distances use Chroma's squared L2 on normalised MiniLM vectors. The global open-question
+# cutoff (0.9276) comes from synthetic MiniLM calibration; person-scoped questions skip it.
 MAX_DISTANCE = SETTINGS.max_distance
 RERANK_DEFAULT = SETTINGS.rerank
 RERANK_MODEL = SETTINGS.rerank_model
@@ -72,21 +73,29 @@ def visible_ids(principal: Principal, restrict_ids=None, db_path=DB_PATH):
 
 
 def search_resumes(query: str, principal: Principal, *, k: int = SETTINGS.top_k, restrict_ids=None,
-                   max_distance: float = None, rerank: bool = None, vector_db=None,
+                   max_distance: float = None, use_distance_cutoff: bool = True,
+                   rerank: bool = None, vector_db=None,
                    db_path=DB_PATH) -> list:
-    """Return Hits, best first. Scope is enforced here, inside the retrieval call."""
+    """Return ranked Hits; enforce scope in retrieval and optionally skip distance filtering."""
     require_source(principal, "resumes")
     ids = visible_ids(principal, restrict_ids, db_path)
     if ids is not None and not ids:
         return []
 
     db = vector_db or _default_vector_db()
+    if not use_distance_cutoff:
+        collection = getattr(db, "_collection", None)
+        count = getattr(collection, "count", None)
+        if callable(count):
+            # With a metadata filter, this asks the vector store for all chunks in scope
+            # before reranking, rather than truncating a long resume at the ordinary top-k.
+            k = max(k, int(count()))
     raw = db.similarity_search_with_score(query, k=k, filter=_build_filter(ids))
 
     cutoff = MAX_DISTANCE if max_distance is None else max_distance
     hits = []
     for doc, dist in raw:
-        if dist > cutoff:
+        if use_distance_cutoff and dist > cutoff:
             continue
         m = doc.metadata
         hits.append(Hit(
@@ -104,6 +113,26 @@ def search_resumes(query: str, principal: Principal, *, k: int = SETTINGS.top_k,
                 h.rerank_score = float(s)
             hits.sort(key=lambda h: -h.rerank_score)
     return hits
+
+
+def prioritize_section(query: str, hits: list) -> list:
+    """Move chunks matching an explicit resume-detail intent ahead of other sections."""
+    text = (query or "").lower()
+    priorities = (
+        ("certifications", r"\b(certifications?|certificates?|licenses?)\b"),
+        ("education", r"\b(education|degree|college|university|academics?)\b"),
+        ("projects", r"\b(projects?|project work)\b"),
+        ("skills", r"\b(skills?|proficiencies)\b"),
+        ("experience", r"\b(intern(ship)?s?|trainees?|experience|worked|working|"
+                        r"built|build|responsibilities|employment)\b"),
+    )
+    section = next((name for name, pattern in priorities if re.search(pattern, text)), None)
+    if section is None:
+        return hits
+    return sorted(hits, key=lambda hit: (
+        hit.section.lower() != section,
+        -(hit.rerank_score if hit.rerank_score is not None else 0),
+        hit.distance if hit.rerank_score is None else 0))
 
 
 def group_by_employee(hits: list, per_employee: int = 3, max_employees: int = 5) -> list:

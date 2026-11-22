@@ -14,6 +14,15 @@ _PREFIXES = re.compile(
     r"info(?:rmation)?\s+(?:on|about|of)|profile\s+of|contact\s+(?:details\s+)?(?:of|for)|"
     r"show\s+me|show|find|search\s+for|look\s*up|get)\s+(.+)$")
 _SUFFIXES = re.compile(r"(?:'s|s')?\s+(?:manager|email|contact|designation|details|profile|id)$")
+_DETAIL_PATTERNS = (
+    re.compile(r"\bwhat\s+(?:(?:did|does|has)\s+)?(.+?)\s+(?:do|build|make|create|develop|work|use|deliver)\b", re.I),
+    re.compile(r"\bwhat\s+experience\s+does\s+(.+?)\s+have\b", re.I),
+    re.compile(r"\bwhat\s+(?:projects?|certifications?|education)\s+(?:has|have|did|does)\s+(.+?)\s+(?:done|completed|earned|studied|worked)\b", re.I),
+    re.compile(r"\bwhat\s+are\s+(.+?)['’]s\s+(?:skills|projects|experience|internship|certifications?|education)\b", re.I),
+    re.compile(r"\bwhat\s+is\s+(.+?)['’]s\s+(?:skills|projects|experience|internship|certifications?|education)\b", re.I),
+    re.compile(r"\b(?:tell\s+me\s+about|describe|summari[sz]e)\s+(.+?)['’]s\s+(?:skills|projects|experience|internship|certifications?|education)\b", re.I),
+    re.compile(r"\b(.+?)['’]s\s+(?:skills|projects|experience|internship|certifications?|education)\b", re.I),
+)
 _TITLES = re.compile(r"^(?:mr|mrs|ms|dr|shri|smt)\.?\s+")
 _NAME_TOKEN = re.compile(r"[^\W\d_][\w'.-]*")
 _STOP = {
@@ -54,6 +63,20 @@ def parse_name_query(message: str):
 
 def name_candidate(message: str):
     return parse_name_query(message)[0]
+
+
+def parse_person_detail_query(message: str):
+    """Return (person name, detail kind) for a common named-person detail question."""
+    text = (message or "").strip()
+    for pattern in _DETAIL_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            name = re.sub(r"\s+(?:during|in|as|at)\s+.*$", "", match.group(1), flags=re.I)
+            candidate, _ = parse_name_query(name)
+            if candidate:
+                detail = "skills" if re.search(r"\bskills?\b", text, re.I) else "resume"
+                return candidate, detail
+    return None, None
 
 
 def manager_of_query(message: str):

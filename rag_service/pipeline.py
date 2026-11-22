@@ -7,14 +7,15 @@ import re
 from dataclasses import dataclass, field
 
 from .access import Principal, allowed_sources, ROLE_MANAGER
-from .retriever import search_resumes, group_by_employee
-from .sql_tool import query_workforce
+from .retriever import search_resumes, group_by_employee, prioritize_section
+from .sql_tool import query_person_skills, query_workforce
 from .people import (
     find_own_manager,
     find_person,
     is_self_profile_query,
     manager_of_query,
     name_matches,
+    parse_person_detail_query,
     parse_name_query,
     team_owner_query,
 )
@@ -75,6 +76,7 @@ class RagAnswer:
     sources: list = field(default_factory=list)
     sql: str = None
     sql_error: str = None
+    retrieval_debug: list = field(default_factory=list)
 
 
 def _history_text(history) -> str:
@@ -159,6 +161,21 @@ def _availability_question(question: str) -> bool:
                           (question or "").lower()))
 
 
+def _basic_profile_intent(question: str) -> bool:
+    detail_intent = re.search(
+        r"\b(skills?|experience|projects?|internship|accomplishments?|responsibilities|"
+        r"built|build|worked|work|resume|tools)\b", (question or "").lower())
+    return not detail_intent and bool(re.search(
+        r"\b(who\s+is|who's|contact|email|designation|department|manager)\b",
+        (question or "").lower()))
+
+
+def _name_only_profile(question: str) -> bool:
+    return (parse_name_query(question)[0] is not None and not re.search(
+        r"\b(skills?|experience|projects?|internship|accomplishments?|responsibilities|"
+        r"built|build|worked|work|resume|tools)\b", (question or "").lower()))
+
+
 def _availability_reply(sql_result) -> str:
     """List structured matches without guessing their current project availability."""
     columns = [column.lower() for column in sql_result.columns]
@@ -188,6 +205,56 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
             return RagAnswer(_manager_profile_reply(manager), "person", question,
                              [{"type": "sql", "query": "own manager profile", "rows": 1}])
 
+    named_person, detail_kind = parse_person_detail_query(question)
+    if named_person and "employee_db" in sources:
+        matches = find_person(named_person, principal,
+                              fuzzy=len(named_person.split()) >= 2, **kw_db)
+        if not matches:
+            # Never broaden a named-person request to unrelated people in the caller's scope.
+            return RagAnswer(_not_found(principal),
+                             "sql" if detail_kind == "skills" else "resumes", question)
+        employee = matches[0]
+        if detail_kind == "skills":
+            sql_result = query_person_skills(employee["employee_id"], principal, **kw_db)
+            if not sql_result.rows:
+                return RagAnswer(_not_found(principal), "sql", question,
+                                 sql=sql_result.sql, sql_error=sql_result.error)
+            lines = [f"- {row[2]}: {row[3] or 'not specified'} proficiency, "
+                     f"{row[4] if row[4] is not None else 'unknown'} years"
+                     for row in sql_result.rows]
+            answer = f"**{employee['name']}**'s recorded skills:\n" + "\n".join(lines)
+            return RagAnswer(answer, "sql", question,
+                             [{"type": "sql", "query": sql_result.sql,
+                               "rows": len(sql_result.rows),
+                               "employee_ids": [employee["employee_id"]]}],
+                             sql=sql_result.sql)
+        hits = search_resumes(
+            question, principal, k=max(SETTINGS.top_k, 100),
+            restrict_ids={employee["employee_id"]}, use_distance_cutoff=False,
+            vector_db=vector_db, rerank=rerank, **kw_db)
+        hits = prioritize_section(question, hits)
+        evidence = group_by_employee(hits, per_employee=3, max_employees=3)
+        if not evidence:
+            return RagAnswer(_not_found(principal), "resumes", question)
+        excerpts = []
+        for person in evidence:
+            for hit in person.hits:
+                excerpts.append(
+                    f'<resume_excerpt employee="{person.employee_id}" '
+                    f'name="{_scrub(person.name)}" section="{hit.section}">\n'
+                    f'{_scrub(hit.text)}\n</resume_excerpt>')
+        answer = llm(ANSWER_PROMPT.format(
+            role=principal.role.title(), question=question,
+            context="RESUME EXCERPTS:\n" + "\n".join(excerpts))).strip()
+        return RagAnswer(answer, "resumes", question,
+                         [{"type": "resume", "employee_id": hit.employee_id,
+                           "name": hit.name, "section": hit.section,
+                           "distance": round(hit.distance, 3)}
+                          for person in evidence for hit in person.hits],
+                         retrieval_debug=[{"employee_id": hit.employee_id,
+                                           "section": hit.section, "rank": rank}
+                                          for rank, hit in enumerate(hits, 1)])
+
     manager_target = manager_of_query(question)
     if manager_target:
         matches = find_person(manager_target, principal, **kw_db)
@@ -209,7 +276,7 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
     # Fast path: a bare name / "who is X" is a profile lookup. No model call needed; if nobody
     # matches, fall through to normal routing (it may be a skills or counting question).
     candidate, explicit = parse_name_query(question) if "employee_db" in sources else (None, False)
-    if candidate:
+    if candidate and (_basic_profile_intent(question) or _name_only_profile(question)):
         # typos are only forgiven for clear lookups ("who is X", or 2+ words), never for a bare
         # single word, so a skill like "python" cannot be mistaken for an employee "Peyton"
         matches = find_person(candidate, principal,
@@ -235,6 +302,21 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
                                  "denied", standalone)
     if route == "other":
         return RagAnswer(OTHER_REPLY, "other", standalone)
+    person_restrict = None
+    person_scoped = False
+    is_name_only_profile = _name_only_profile(standalone)
+    if route == "person" and not (_basic_profile_intent(standalone) or is_name_only_profile):
+        # A router misclassification must never turn a detail question into a profile card.
+        detail_name, _ = parse_person_detail_query(standalone)
+        name = person_name or detail_name
+        if name:
+            matches = find_person(name, principal,
+                                  fuzzy=len(name.split()) >= 2, **kw_db)
+            if not matches:
+                return RagAnswer(_not_found(principal), "resumes", standalone)
+            person_restrict = {match["employee_id"] for match in matches}
+            person_scoped = True
+        route = "resumes"
     if route == "person":
         if "employee_db" not in sources:
             return RagAnswer(NO_ACCESS_REPLY, "denied", standalone)
@@ -260,8 +342,15 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
                 restrict = set()          # the structured filter matched nobody -> no candidates
     if route in ("resumes", "both") and "resumes" in sources:
         if not (route == "both" and restrict is not None and not restrict):
-            hits = search_resumes(standalone, principal, restrict_ids=restrict,
-                                  vector_db=vector_db, rerank=rerank, **kw_db)
+            if person_restrict is not None:
+                restrict = person_restrict
+            hits = search_resumes(
+                standalone, principal, k=(max(SETTINGS.top_k, 100) if person_scoped
+                                          else SETTINGS.top_k),
+                restrict_ids=restrict, use_distance_cutoff=not person_scoped,
+                vector_db=vector_db, rerank=rerank, **kw_db)
+            if person_scoped:
+                hits = prioritize_section(standalone, hits)
 
     evidence = group_by_employee(hits)
     has_sql = bool(sql_result and sql_result.rows)
@@ -302,6 +391,10 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
         for h in e.hits:
             srcs.append({"type": "resume", "employee_id": e.employee_id, "name": e.name,
                          "section": h.section, "distance": round(h.distance, 3)})
+    retrieval_debug = ([{"employee_id": hit.employee_id, "section": hit.section,
+                         "rank": rank} for rank, hit in enumerate(hits, 1)]
+                       if person_scoped else [])
     return RagAnswer(text, route, standalone, srcs,
                      sql=sql_result.sql if sql_result else None,
-                     sql_error=sql_result.error if sql_result else None)
+                     sql_error=sql_result.error if sql_result else None,
+                     retrieval_debug=retrieval_debug)
