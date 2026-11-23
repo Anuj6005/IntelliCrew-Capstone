@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ask IntelliCrew</title>
+  <link rel="stylesheet" href="/static/chat.css">
+</head>
+<body class="chat-page">
+  <header class="chat-topbar">
+    <a class="chat-brand" href="/home" aria-label="IntelliCrew home">
+      <span class="chat-brand-mark">IC</span>
+      <span>IntelliCrew</span>
+    </a>
+    <div class="chat-user">
+      <span>{{ user_name }}</span>
+      <span class="chat-role">{{ role|title }}</span>
+      <button id="chat-logout" class="chat-logout" type="button">Log out</button>
+    </div>
+  </header>
+
+  <aside class="chat-sidebar">
+    <p class="chat-sidebar-label">{{ role|title }} Portal</p>
+    <nav class="chat-nav" aria-label="Main navigation">
+      <a class="chat-nav-item" href="/home"><span aria-hidden="true">H</span>Home</a>
+      {% if role == "HR" %}
+      <a class="chat-nav-item" href="/hr/dashboard"><span aria-hidden="true">D</span>Dashboard</a>
+      {% else %}
+      <a class="chat-nav-item" href="/manager/dashboard"><span aria-hidden="true">D</span>Dashboard</a>
+      {% endif %}
+      <a class="chat-nav-item active" href="/ask-intellicrew" aria-current="page">
+        <span aria-hidden="true">✦</span>Ask IntelliCrew
+      </a>
+    </nav>
+  </aside>
+
+  <main class="chat-main">
+    <section class="chat-shell" aria-label="IntelliCrew chat">
+      <header class="chat-heading">
+        <div>
+          <p class="chat-eyebrow">Your workplace assistant</p>
+          <h1>Ask IntelliCrew</h1>
+          <p class="chat-subtitle">Ask about your team, skills, experience, and availability.</p>
+        </div>
+        <button id="rag-chat-new" class="new-chat" type="button">＋ New chat</button>
+      </header>
+
+      <div id="rag-chat-messages" class="chat-messages" role="log"
+           aria-live="polite" aria-relevant="additions text">
+        <section id="chat-welcome" class="chat-welcome">
+          <div class="welcome-mark" aria-hidden="true">✦</div>
+          <h2>What can I help you find?</h2>
+          <p>Choose a question or type your own below.</p>
+          <div class="chat-examples">
+            {% for example in examples %}
+            <button class="chat-example" type="button" data-prompt="{{ example }}">{{ example }}</button>
+            {% endfor %}
+          </div>
+        </section>
+      </div>
+
+      <p id="rag-chat-status" class="chat-status" role="status" aria-live="polite"></p>
+      <form id="rag-chat-form" class="chat-composer">
+        <label class="visually-hidden" for="rag-chat-input">Your message</label>
+        <textarea id="rag-chat-input" rows="1" maxlength="2000"
+                  placeholder="Ask a question…" required></textarea>
+        <button id="rag-chat-send" type="submit" aria-label="Send message">Send</button>
+        <p class="composer-hint">Enter to send · Shift+Enter for a new line</p>
+      </form>
+    </section>
+  </main>
+  <script src="/static/chat.js" defer></script>
+</body>
+</html>

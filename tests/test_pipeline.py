@@ -1,4 +1,5 @@
 import json, math, os, sqlite3, pytest
+from datetime import date, timedelta
 from types import SimpleNamespace
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 from langchain_core.embeddings import Embeddings
@@ -149,7 +150,8 @@ def test_resume_text_cannot_close_the_delimiter():
 def test_sql_failure_message(vdb):
     llm = Stub("sql", "DROP TABLE employees")
     r = run("delete everything", HR, llm, vdb)
-    assert "rephrase" in r.answer and r.sql_error
+    assert "I can answer employee profiles" in r.answer
+    assert r.sql_error == "unsupported structured question"
 
 def test_retriever_scope_is_enforced_even_if_caller_asks_for_more(vdb):
     hits = search_resumes("kubernetes terraform", M1, restrict_ids={"E003"}, vector_db=vdb, rerank=False, db_path=DB)
@@ -238,12 +240,33 @@ def test_manager_can_filter_own_team_by_job_title(vdb):
     assert "E002" not in answer_prompt
 
 
-def test_availability_is_not_inferred_from_a_job_title_match(vdb):
+def test_availability_uses_current_project_allocations(vdb):
+    today = date.today()
+    start = (today - timedelta(days=1)).isoformat()
+    end = (today + timedelta(days=1)).isoformat()
+    connection = sqlite3.connect(DB)
+    connection.execute(
+        "INSERT INTO projects (project_id, project_name, client, start_date, end_date, status) "
+        "VALUES (9001, 'Current Test Project', 'Test Client', ?, ?, 'In Progress')",
+        (start, end))
+    connection.execute(
+        "INSERT INTO project_allocation (employee_id, employee_email, project_id, project_name, "
+        "manager_name) VALUES ('E001', 'a@x.com', 9001, 'Current Test Project', 'Aarav Sharma')")
+    connection.commit()
+    connection.close()
     llm = Stub("sql", standalone="List Python developers")
-    result = run("Python developers available", M1, llm, vdb)
-    assert "E001, Aarav Mehta (Python Developer)" in result.answer
-    assert "can't confirm who is available" in result.answer
-    assert llm.answer_prompts() == []
+    try:
+        result = run("Python developers available", M1, llm, vdb)
+        assert "No employees currently match" in result.answer
+        assert "E001" not in result.answer
+        assert result.route == "sql"
+        assert llm.prompts == []
+    finally:
+        connection = sqlite3.connect(DB)
+        connection.execute("DELETE FROM project_allocation WHERE project_id = 9001")
+        connection.execute("DELETE FROM projects WHERE project_id = 9001")
+        connection.commit()
+        connection.close()
 
 
 def test_manager_self_and_manager_of_lookups(vdb):

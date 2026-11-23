@@ -14,6 +14,7 @@
 <button class="nav-item active" onclick="location.href='/manager/dashboard'"><span class="nav-icon">D</span><span class="nav-text">Dashboard</span></button>
 <button class="nav-item" onclick="location.href='/home#requirementContent'"><span class="nav-icon">+</span><span class="nav-text">Create Requirement</span></button>
 <button class="nav-item" onclick="location.href='/home#summarizerContent'"><span class="nav-icon">V</span><span class="nav-text">Video Summarizer</span></button>
+<a class="nav-item" href="/ask-intellicrew"><span class="nav-icon" aria-hidden="true">✦</span><span class="nav-text">Ask IntelliCrew</span></a>
 </nav></aside>
 <main>
 <div class="page-head"><div><h1>Welcome, {{ manager_name|default('Manager') }}</h1><p class="subtitle">Here is a quick view of your team and projects today.</p></div><span class="date-pill">{{ today|default('Today') }}</span></div>

@@ -3,6 +3,7 @@ import hashlib
 import math
 import re
 import sqlite3
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -169,7 +170,13 @@ def build_eval_fixture(root_dir, real_embeddings=False):
         "INSERT INTO hr (hr_id, full_name, email, password_hash) VALUES (?, ?, ?, ?)",
         ("H001", "Fictional HR User", "h001@eval.invalid", "synthetic-only"),
     )
-    connection.executemany("INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?)", PROJECTS)
+    project_rows = list(PROJECTS)
+    today = date.today()
+    active_project = project_rows[0]
+    project_rows[0] = (active_project[0], active_project[1], active_project[2],
+                       active_project[3], (today - timedelta(days=30)).isoformat(),
+                       (today + timedelta(days=30)).isoformat(), "In Progress")
+    connection.executemany("INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?)", project_rows)
 
     all_skills = sorted({skill for employee in EMPLOYEES for skill in employee[5]})
     skill_ids = {name: index + 1 for index, name in enumerate(all_skills)}
@@ -202,7 +209,7 @@ def build_eval_fixture(root_dir, real_embeddings=False):
             (eid, skill_ids[skills[0]], f"{skills[0]} Assessment", 88.0,
              "2025-02-01", "Passed"))
         project_id = index % len(PROJECTS) + 1
-        project = PROJECTS[project_id - 1]
+        project = project_rows[project_id - 1]
         allocation_rows.append(
             (eid, f"{eid.lower()}@eval.invalid", project_id, project[1], "Synthetic allocation", 0,
              dict(MANAGERS).get(manager, "Synthetic Manager")))

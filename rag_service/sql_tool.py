@@ -10,6 +10,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 from .access import DB_PATH, Principal, employee_scope, require_source
@@ -206,6 +207,162 @@ def query_person_skills(employee_id: str, principal: Principal, db_path=DB_PATH)
     conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
     try:
         cursor = conn.execute(sql, query_params)
+        return SqlResult(sql, [column[0] for column in cursor.description], cursor.fetchall())
+    except sqlite3.Error as error:
+        return SqlResult("", error=str(error))
+    finally:
+        conn.close()
+
+
+ACTIVE_ALLOCATION_RULE = (
+    "An active allocation is a project_allocation row linked to a project whose status is "
+    "In Progress and whose start/end dates include today; a missing date bound is allowed. "
+    "An employee is available when employees.status is Active and they have no active allocation."
+)
+
+
+def query_person_work_status(employee_id: str, principal: Principal, db_path=DB_PATH,
+                             *, today=None) -> SqlResult:
+    """Return one in-scope employee's status and all allocation/project details.
+
+    Allocation activity follows ACTIVE_ALLOCATION_RULE. Values and dates are bound parameters;
+    the manager predicate is applied before a named employee id can match.
+    """
+    require_source(principal, "employee_db")
+    scope = "e.manager_id = ?" if principal.role == "MANAGER" else "1 = 1"
+    scope_params = [principal.user_id] if principal.role == "MANAGER" else []
+    as_of = (today or date.today()).isoformat()
+    sql = (
+        "SELECT e.employee_id, e.full_name, e.status AS employee_status, "
+        "COALESCE(p.project_name, a.project_name) AS project_name, p.client, "
+        "p.status AS project_status, p.start_date, p.end_date, a.manager_name, "
+        "CASE WHEN LOWER(COALESCE(p.status, '')) = 'in progress' "
+        "AND (p.start_date IS NULL OR date(p.start_date) <= date(?)) "
+        "AND (p.end_date IS NULL OR date(p.end_date) >= date(?)) "
+        "THEN 1 ELSE 0 END AS active_allocation "
+        "FROM employees e "
+        "LEFT JOIN project_allocation a ON a.employee_id = e.employee_id "
+        "LEFT JOIN projects p ON (p.project_id = a.project_id OR "
+        "(a.project_id IS NULL AND LOWER(p.project_name) = LOWER(a.project_name))) "
+        f"WHERE ({scope}) AND e.employee_id = ? "
+        "ORDER BY active_allocation DESC, project_name LIMIT ?")
+    params = [as_of, as_of, *scope_params, employee_id, MAX_ROWS]
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        cursor = conn.execute(sql, params)
+        return SqlResult(sql, [column[0] for column in cursor.description], cursor.fetchall())
+    except sqlite3.Error as error:
+        return SqlResult("", error=str(error))
+    finally:
+        conn.close()
+
+
+def _skill_filter(question: str, conn: sqlite3.Connection):
+    """Find a database skill mentioned in the query; unknown requested skills match nothing."""
+    text = (question or "").lower()
+    skills = [row[0] for row in conn.execute(
+        "SELECT skill_name FROM skills WHERE skill_name IS NOT NULL")]
+    for skill in sorted(skills, key=len, reverse=True):
+        if re.search(r"(?<![a-z0-9])" + re.escape(skill.lower()) + r"(?![a-z0-9])", text):
+            return skill
+    role = re.search(
+        r"\b(developers?|engineers?|analysts?|designers?|scientists?|architects?|"
+        r"consultants?|specialists?)\b", text)
+    if role:
+        prefix = text[:role.start()]
+        prefix = re.sub(r"\b(who|is|are|list|show|find|any|available|availability|"
+                        r"free|unallocated|bench|the|a|an|in|from|my|our|their|team)\b", " ", prefix)
+        prefix = re.sub(r"\s+", " ", prefix).strip()
+        if prefix:
+            return prefix
+    return None
+
+
+def query_workforce_status(question: str, principal: Principal, db_path=DB_PATH,
+                           *, today=None) -> SqlResult:
+    """Return scoped availability/allocation lists or active employee counts.
+
+    List/count scope is limited to employees whose status is Active. Count categories are
+    complementary: active allocation versus no active allocation, using ACTIVE_ALLOCATION_RULE.
+    """
+    require_source(principal, "employee_db")
+    text = (question or "").lower()
+    allocation_words = r"allocat\w*|unallocated|assigned|on\s+a\s+project"
+    count_query = bool(re.search(r"\b(how many|count|number of)\b", text) and
+                       re.search(r"\b(?:" + allocation_words + r")\b", text))
+    available_query = bool(re.search(
+        r"\b(available|availability|free|bench|unallocated)\b|\bnot\s+allocated\b", text))
+    allocated_query = bool(re.search(r"\b(?:allocated|assigned)\b|\bon\s+a\s+project\b", text))
+    if not (count_query or available_query or allocated_query):
+        return SqlResult("", error="unsupported structured question")
+
+    as_of = (today or date.today()).isoformat()
+    manager_scope = "e.manager_id = ?" if principal.role == "MANAGER" else "1 = 1"
+    manager_params = [principal.user_id] if principal.role == "MANAGER" else []
+    active_cte = (
+        "WITH active_allocations AS ("
+        "SELECT a.employee_id, COALESCE(p.project_name, a.project_name) AS project_name, "
+        "p.client, p.status AS project_status, p.start_date, p.end_date, a.manager_name "
+        "FROM project_allocation a JOIN projects p ON (p.project_id = a.project_id OR "
+        "(a.project_id IS NULL AND LOWER(p.project_name) = LOWER(a.project_name))) "
+        "WHERE LOWER(COALESCE(p.status, '')) = 'in progress' "
+        "AND (p.start_date IS NULL OR date(p.start_date) <= date(?)) "
+        "AND (p.end_date IS NULL OR date(p.end_date) >= date(?))) ")
+    params = [as_of, as_of]
+
+    if count_query:
+        sql = (active_cte +
+               "SELECT COUNT(DISTINCT CASE WHEN aa.employee_id IS NOT NULL "
+               "THEN e.employee_id END) AS allocated_count, "
+               "COUNT(DISTINCT CASE WHEN aa.employee_id IS NULL "
+               "THEN e.employee_id END) AS unallocated_count "
+               "FROM employees e LEFT JOIN active_allocations aa "
+               "ON aa.employee_id = e.employee_id "
+               f"WHERE ({manager_scope}) AND LOWER(TRIM(COALESCE(e.status, ''))) = 'active'")
+        params.extend(manager_params)
+    else:
+        sql = (active_cte +
+               "SELECT DISTINCT e.employee_id, e.full_name, e.designation, e.status, "
+               "aa.project_name, aa.client, aa.project_status, aa.start_date, aa.end_date, "
+               "aa.manager_name, CASE WHEN aa.employee_id IS NULL THEN 0 ELSE 1 END "
+               "AS active_allocation FROM employees e "
+               "LEFT JOIN active_allocations aa ON aa.employee_id = e.employee_id ")
+        conditions = [f"({manager_scope})",
+                      "LOWER(TRIM(COALESCE(e.status, ''))) = 'active'"]
+        params.extend(manager_params)
+        conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            skill = _skill_filter(text, conn)
+        except sqlite3.Error as error:
+            return SqlResult("", error=str(error))
+        finally:
+            conn.close()
+        if skill:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM employee_skills es JOIN skills s "
+                "ON s.skill_id = es.skill_id WHERE es.employee_id = e.employee_id "
+                "AND LOWER(s.skill_name) = LOWER(?))")
+            params.append(skill)
+        role = re.search(
+            r"\b(developers?|engineers?|analysts?|designers?|scientists?|architects?|"
+            r"consultants?|specialists?)\b", text)
+        if role:
+            designation = re.sub(r"s$", "", role.group(1))
+            conditions.append("instr(LOWER(e.designation), LOWER(?)) > 0")
+            params.append(designation)
+        if available_query:
+            conditions.append("aa.employee_id IS NULL")
+        elif allocated_query:
+            conditions.append("aa.employee_id IS NOT NULL")
+        else:
+            return SqlResult("", error="unsupported structured question")
+        sql += "WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY e.full_name, aa.project_name LIMIT ?"
+        params.append(MAX_ROWS)
+
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        cursor = conn.execute(sql, params)
         return SqlResult(sql, [column[0] for column in cursor.description], cursor.fetchall())
     except sqlite3.Error as error:
         return SqlResult("", error=str(error))

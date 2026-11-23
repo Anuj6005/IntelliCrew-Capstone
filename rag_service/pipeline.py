@@ -8,7 +8,13 @@ from dataclasses import dataclass, field
 
 from .access import Principal, allowed_sources, ROLE_MANAGER
 from .retriever import search_resumes, group_by_employee, prioritize_section
-from .sql_tool import query_person_skills, query_workforce
+from .sql_tool import (
+    ACTIVE_ALLOCATION_RULE,
+    query_person_skills,
+    query_person_work_status,
+    query_workforce,
+    query_workforce_status,
+)
 from .people import (
     find_own_manager,
     find_person,
@@ -16,6 +22,7 @@ from .people import (
     manager_of_query,
     name_matches,
     parse_person_detail_query,
+    parse_person_work_query,
     parse_name_query,
     team_owner_query,
 )
@@ -156,11 +163,6 @@ def _not_found(principal: Principal) -> str:
     return f"I couldn't find anything in {scope} that matches that."
 
 
-def _availability_question(question: str) -> bool:
-    return bool(re.search(r"\b(available|availability|free|unallocated)\b",
-                          (question or "").lower()))
-
-
 def _basic_profile_intent(question: str) -> bool:
     detail_intent = re.search(
         r"\b(skills?|experience|projects?|internship|accomplishments?|responsibilities|"
@@ -176,19 +178,109 @@ def _name_only_profile(question: str) -> bool:
         r"built|build|worked|work|resume|tools)\b", (question or "").lower()))
 
 
-def _availability_reply(sql_result) -> str:
-    """List structured matches without guessing their current project availability."""
-    columns = [column.lower() for column in sql_result.columns]
-    id_index = columns.index("employee_id")
-    name_index = columns.index("full_name")
-    designation_index = columns.index("designation") if "designation" in columns else None
-    lines = []
-    for row in sql_result.rows:
-        designation = (f" ({row[designation_index]})" if designation_index is not None
-                       and row[designation_index] else "")
-        lines.append(f"- {row[id_index]}, {row[name_index]}{designation}")
-    return ("I found these matching employees, but the records don't include current "
-            "project availability, so I can't confirm who is available:\n" + "\n".join(lines))
+def _columns_by_name(result):
+    return {name.lower(): index for index, name in enumerate(result.columns)}
+
+
+def _work_sql_source(result, employee_ids):
+    return [{"type": "sql", "query": result.sql, "rows": len(result.rows),
+             "employee_ids": sorted(set(employee_ids))}]
+
+
+def _person_work_reply(result, kind):
+    columns = _columns_by_name(result)
+    if not result.rows:
+        return "I couldn't find that employee in the records available to you."
+    row = result.rows[0]
+    employee_id = row[columns["employee_id"]]
+    name = row[columns["full_name"]]
+    employee_status = row[columns["employee_status"]] or "not recorded"
+    active_rows = [item for item in result.rows
+                   if item[columns["project_name"]] and
+                   bool(item[columns["active_allocation"]])]
+    is_active_employee = str(employee_status).strip().lower() == "active"
+    available = is_active_employee and not active_rows
+    lines = [f"**{name}** ({employee_id}) [SQL]",
+             f"- Employee status: {employee_status}."]
+    if kind in ("availability", "allocation"):
+        if available:
+            lines.append("- Availability: available; no active project allocation.")
+        elif active_rows:
+            lines.append("- Availability: allocated to an active project.")
+        else:
+            lines.append("- Availability: not available because the employee status is not Active.")
+        lines.append("- Active allocation rule: the linked project is In Progress and today's "
+                     "date falls within its start/end dates (missing date bounds are allowed).")
+    if kind == "allocation":
+        allocations = [item for item in result.rows if item[columns["project_name"]]]
+        if not allocations:
+            lines.append("- No project allocations are recorded.")
+        else:
+            for item in allocations:
+                active = bool(item[columns["active_allocation"]])
+                project = item[columns["project_name"]]
+                client = item[columns["client"]] or "client not recorded"
+                project_status = item[columns["project_status"]] or "status not recorded"
+                start = item[columns["start_date"]] or "not recorded"
+                end = item[columns["end_date"]] or "not recorded"
+                manager = item[columns["manager_name"]] or "not recorded"
+                tag = "active allocation" if active else "not currently active"
+                lines.append(
+                    f"- {project} ({client}) — {project_status}, {start} to {end}; "
+                    f"allocating manager: {manager}; {tag}.")
+    elif kind == "availability" and active_rows:
+        for item in active_rows:
+            lines.append(f"- Active project: {item[columns['project_name']]} "
+                         f"({item[columns['client']] or 'client not recorded'}), "
+                         f"through {item[columns['end_date']] or 'no recorded end date'}; "
+                         f"allocating manager: {item[columns['manager_name']] or 'not recorded'}.")
+    return "\n".join(lines)
+
+
+def _workforce_status_reply(result, question):
+    if not result.rows:
+        return ("No employees currently match that availability or allocation query. "
+                "[SQL]")
+    columns = _columns_by_name(result)
+    if "allocated_count" in columns:
+        row = result.rows[0]
+        allocated = row[columns["allocated_count"]]
+        unallocated = row[columns["unallocated_count"]]
+        total = allocated + unallocated
+        return (f"Among {total} employees with Active status, {allocated} have an active "
+                f"allocation and {unallocated} have no active allocation. [SQL]\n"
+                f"{ACTIVE_ALLOCATION_RULE}")
+
+    availability_query = bool(re.search(
+        r"\b(available|availability|free|bench|unallocated)\b|\bnot\s+allocated\b",
+        question, re.I))
+    if availability_query:
+        heading = ("Available employees (Active status and no active allocation):\n"
+                   f"{ACTIVE_ALLOCATION_RULE}")
+    else:
+        heading = "Employees with an active project allocation:"
+    lines = [heading]
+    seen = set()
+    for row in result.rows:
+        employee_id = row[columns["employee_id"]]
+        name = row[columns["full_name"]]
+        designation = row[columns["designation"]] or "designation not recorded"
+        item = f"- {name} ({employee_id}), {designation}"
+        if "project_name" in columns and row[columns["project_name"]]:
+            item += (f" — {row[columns['project_name']]} "
+                     f"({row[columns['client']] or 'client not recorded'}), "
+                     f"allocating manager: {row[columns['manager_name']] or 'not recorded'}")
+        if item not in seen:
+            seen.add(item)
+            lines.append(item)
+    return "\n".join(lines) + "\n[SQL]"
+
+
+UNSUPPORTED_STRUCTURED_REPLY = (
+    "I can answer employee profiles and contact details; team and skill lists/counts; "
+    "a named employee's skills, resume experience, education, projects and certifications; "
+    "and employee status, current availability and project allocations. Try asking "
+    "'Who is available?' or 'What project is Aarav Mehta allocated to?'")
 
 
 def answer_question(question: str, principal: Principal, llm, history=None, *,
@@ -204,6 +296,38 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
         if manager:
             return RagAnswer(_manager_profile_reply(manager), "person", question,
                              [{"type": "sql", "query": "own manager profile", "rows": 1}])
+
+    work_question = bool(re.search(
+        r"\b(status|available|availability|free|bench|unallocated|allocated|allocations?)\b|"
+        r"\bon\s+a\s+project\b", question, re.I))
+    if work_question:
+        named_work, work_kind = parse_person_work_query(question)
+        if named_work:
+            matches = find_person(named_work, principal,
+                                  fuzzy=len(named_work.split()) >= 2 or "'s" in question or "’s" in question,
+                                  **kw_db)
+            employee_ids = [match["employee_id"] for match in matches]
+            if not matches:
+                return RagAnswer(_not_found(principal), "sql", question)
+            if len(matches) > 1:
+                choices = "\n".join(
+                    f"- {match['name']} ({match['employee_id']})" for match in matches)
+                return RagAnswer("I found more than one matching employee. Which one do you "
+                                 f"mean?\n{choices}", "sql", question,
+                                 [{"type": "sql", "query": "scoped person lookup",
+                                   "rows": len(matches), "employee_ids": employee_ids}])
+            result = query_person_work_status(matches[0]["employee_id"], principal, **kw_db)
+            if result.error:
+                return RagAnswer(UNSUPPORTED_STRUCTURED_REPLY, "sql", question)
+            return RagAnswer(_person_work_reply(result, work_kind), "sql", question,
+                             _work_sql_source(result, employee_ids), sql=result.sql)
+
+        result = query_workforce_status(question, principal, **kw_db)
+        if result.error:
+            return RagAnswer(UNSUPPORTED_STRUCTURED_REPLY, "sql", question)
+        employee_ids = _employee_id_list(result.columns, result.rows)
+        return RagAnswer(_workforce_status_reply(result, question), "sql", question,
+                         _work_sql_source(result, employee_ids), sql=result.sql)
 
     named_person, detail_kind = parse_person_detail_query(question)
     if named_person and "employee_db" in sources:
@@ -354,17 +478,10 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
 
     evidence = group_by_employee(hits)
     has_sql = bool(sql_result and sql_result.rows)
-    if (has_sql and _availability_question(question) and
-            "employee_id" in [column.lower() for column in sql_result.columns]):
-        return RagAnswer(
-            _availability_reply(sql_result), route, standalone,
-            [{"type": "sql", "query": sql_result.sql, "rows": len(sql_result.rows),
-              "employee_ids": _employee_id_list(sql_result.columns, sql_result.rows)}],
-            sql=sql_result.sql)
     if not has_sql and not evidence:
         msg = _not_found(principal)
         if sql_result and sql_result.error and not hits:
-            msg = "I couldn't turn that into a database query. Could you rephrase it?"
+            msg = UNSUPPORTED_STRUCTURED_REPLY
         return RagAnswer(msg, route, standalone,
                          sql=sql_result.sql if sql_result else None,
                          sql_error=sql_result.error if sql_result else None)

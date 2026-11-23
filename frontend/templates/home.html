@@ -539,6 +539,13 @@
       </button>
       {% endif %}
 
+      {% if userType | lower in ("hr", "manager") %}
+      <a class="nav-item" href="/ask-intellicrew">
+        <span class="nav-icon" aria-hidden="true">✦</span>
+        <span class="nav-text">Ask IntelliCrew</span>
+      </a>
+      {% endif %}
+
       <!-- Create Requirement for all roles -->
       <button
         id="createRequirementButton"

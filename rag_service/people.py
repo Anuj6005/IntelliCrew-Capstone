@@ -79,6 +79,46 @@ def parse_person_detail_query(message: str):
     return None, None
 
 
+def parse_person_work_query(message: str):
+    """Return (name, kind) for a named employee status/availability/allocation query."""
+    text = (message or "").strip()
+    if not re.search(r"\b(status|available|availability|free|bench|unallocated|"
+                     r"allocated|allocations?|projects?)\b", text, re.I):
+        return None, None
+    patterns = (
+        r"\b(?:status|availability|allocations?|project(?:\s+allocation)?"
+        r"(?:\s+status)?)\s+(?:of|for)\s+(.+?)[?!.,]*$",
+        r"\b(?:what\s+project\s+is|which\s+project\s+is)\s+(.+?)\s+"
+        r"(?:allocated|assigned)\s+to[?!.,]*$",
+        r"\b(?:is|are)\s+(.+?)\s+(?:available|free|unallocated|allocated|on\s+a\s+project)"
+        r"[?!.,]*$",
+        r"\b(?:check|show(?:\s+me)?|find|tell\s+me\s+about|what(?:\s+(?:is|are)|'s))\s+"
+        r"(.+?)(?:['’]s|s')\s+(?:current\s+)?(?:employee\s+)?"
+        r"(?:availability|status|project\s+allocation(?:\s+status)?|allocations?|projects?)"
+        r"[?!.,]*$",
+        r"\b(?:check|show(?:\s+me)?|find|what(?:\s+(?:is|are)|'s))\s+(.+?)\s+"
+        r"(?:current\s+)?(?:availability|status|project\s+allocation(?:\s+status)?|"
+        r"allocations?)[?!.,]*$",
+        r"^(.+?)(?:['’]s|s')\s+(?:current\s+)?"
+        r"(?:availability|status|project\s+allocation(?:\s+status)?|allocations?)"
+        r"[?!.,]*$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if not match:
+            continue
+        raw_name = re.sub(r"^(?:(?:the\s+)?(?:employee|person)\s+)", "",
+                          match.group(1).strip(), flags=re.I)
+        candidate, _ = parse_name_query(raw_name)
+        if candidate:
+            kind = ("allocation" if re.search(r"\b(allocat\w*|project)\b", text, re.I)
+                    else "availability" if re.search(
+                        r"\b(available|availability|free|bench|unallocated)\b", text, re.I)
+                    else "status")
+            return candidate, kind
+    return None, None
+
+
 def manager_of_query(message: str):
     """Return the employee name in a direct 'who is X's manager?' question."""
     match = re.search(

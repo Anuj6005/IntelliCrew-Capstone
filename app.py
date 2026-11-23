@@ -4,6 +4,11 @@ import os
 import shutil
 import secrets
 import sqlite3
+import hashlib
+import json
+import threading
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
@@ -36,6 +41,51 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "frontend" / "static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "frontend" / "templates"))
 
 SESSIONS: dict[str, dict] = {}
+
+# The RAG model and index are loaded only after an authorized user opens chat.
+_rag_service = None
+_rag_service_lock = threading.Lock()
+_chat_request_times = {}
+_chat_request_lock = threading.Lock()
+
+
+def _get_rag_service():
+    global _rag_service
+    if _rag_service is None:
+        with _rag_service_lock:
+            if _rag_service is None:
+                from rag_service.service import RagService
+                _rag_service = RagService()
+    return _rag_service
+
+
+def _session_key(sid: str) -> str:
+    return hashlib.sha256(sid.encode("utf-8")).hexdigest()
+
+
+def _allow_chat_request(session_key: str) -> bool:
+    now = time.monotonic()
+    with _chat_request_lock:
+        requests = _chat_request_times.setdefault(session_key, deque())
+        while requests and now - requests[0] >= 60:
+            requests.popleft()
+        if len(requests) >= 20:
+            return False
+        requests.append(now)
+        return True
+
+
+def _require_json(request: Request):
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().lower() != "application/json":
+        raise HTTPException(415, "Send a JSON request.")
+
+
+def _chat_session(sid: str | None):
+    session = require_session(sid)
+    if session.get("role") not in ("HR", "MANAGER"):
+        raise HTTPException(403, "Chat is available to HR and managers.")
+    return session
 
 
 # ---------- models ----------
@@ -82,6 +132,34 @@ def home(request: Request, sid: str | None = Cookie(None, alias=COOKIE)):
         request=request,
         name="home.html",
         context={"userType": s["role"].lower(), "userId": s["user_id"], "userName": s["name"]},
+    )
+
+
+@app.get("/ask-intellicrew", response_class=HTMLResponse, include_in_schema=False)
+def ask_intellicrew(request: Request, sid: str | None = Cookie(None, alias=COOKIE)):
+    session = get_session(sid)
+    if not session:
+        return RedirectResponse("/", status_code=303)
+    if session.get("role") not in ("HR", "MANAGER"):
+        raise HTTPException(403, "Chat is available to HR and managers.")
+
+    examples = (
+        ["Who is in my team?", "Available Python developers in my team",
+         "What did Aarav Mehta build during his internship?",
+         "Is Aarav Mehta available?"]
+        if session["role"] == "MANAGER" else
+        ["Who knows Python?", "What are Aarav Mehta's skills?",
+         "What did Aarav Mehta build during his internship?", "Who is available?"]
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="chat.html",
+        context={
+            "request": request,
+            "role": session["role"],
+            "user_name": session.get("name") or session.get("full_name") or session["role"],
+            "examples": examples,
+        },
     )
 
 
@@ -134,6 +212,68 @@ def logout(response: Response, sid: str | None = Cookie(None, alias=COOKIE)):
 def current_user(sid: str | None = Cookie(None, alias=COOKIE)):
     s = require_session(sid)
     return {"user_id": s["user_id"], "name": s["name"], "role": s["role"]}
+
+
+@app.post("/api/chat")
+async def chat(request: Request, sid: str | None = Cookie(None, alias=COOKIE)):
+    from starlette.concurrency import run_in_threadpool
+    from rag_service.access import Principal
+
+    session = _chat_session(sid)
+    _require_json(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Request body must be valid JSON.")
+    if not isinstance(payload, dict) or not isinstance(payload.get("message"), str):
+        raise HTTPException(400, "A message is required.")
+    session_key = _session_key(sid)
+    if not _allow_chat_request(session_key):
+        raise HTTPException(429, "Too many chat requests. Please wait a minute.")
+
+    principal = Principal(session["role"], session["user_id"])
+    conversation_id = session_key
+    try:
+        result = await run_in_threadpool(
+            lambda: _get_rag_service().chat(
+                conversation_id, payload["message"], principal))
+    except ValueError as error:
+        return Response(
+            content=json.dumps({"error": str(error)}),
+            status_code=422, media_type="application/json")
+    if result.route == "error":
+        return Response(
+            content=json.dumps({"error": result.answer}),
+            status_code=503, media_type="application/json")
+    return {"answer": result.answer, "route": result.route, "sources": result.sources}
+
+
+@app.post("/api/chat/clear")
+async def clear_chat(request: Request, sid: str | None = Cookie(None, alias=COOKIE)):
+    from starlette.concurrency import run_in_threadpool
+    from rag_service.access import Principal
+
+    session = _chat_session(sid)
+    _require_json(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Request body must be valid JSON.")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Request body must be a JSON object.")
+    principal = Principal(session["role"], session["user_id"])
+    await run_in_threadpool(
+        lambda: _get_rag_service().clear(_session_key(sid), principal))
+    return {"ok": True}
+
+
+@app.get("/api/chat/history")
+def chat_history(sid: str | None = Cookie(None, alias=COOKIE)):
+    from rag_service.access import Principal
+
+    session = _chat_session(sid)
+    principal = Principal(session["role"], session["user_id"])
+    return _get_rag_service().history(_session_key(sid), principal)
 
 
 # ---------- resume upload (HR only) — now goes through the orchestrator ----------

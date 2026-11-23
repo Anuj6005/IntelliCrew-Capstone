@@ -30,7 +30,7 @@ def test_fixture_builds_fictional_db_and_in_memory_index(tmp_path):
 
 def test_eval_stub_runs_golden_set_and_writes_reports_to_requested_directory(tmp_path):
     cases = load_golden_questions()
-    assert 50 <= len(cases) <= 60
+    assert len(cases) >= 68
     output_dir = tmp_path / "reports"
     workspace = tmp_path / "workspace"
 
@@ -207,6 +207,16 @@ def test_named_person_detail_golden_cases_include_vague_phrasing_and_scope():
     section_cases = [case for case in cases if case.get("expected_sections")]
     assert {section for case in section_cases for section in case["expected_sections"]} >= {
         "experience", "projects", "certifications", "education"}
+
+
+def test_t9_work_status_golden_cases_cover_lists_counts_and_foreign_scope():
+    cases = [case for case in load_golden_questions()
+             if case["id"].startswith("work_")]
+    assert len(cases) >= 10
+    assert all(case["expected_route"] == "sql" for case in cases)
+    assert any(case.get("forbidden_employee_ids") for case in cases)
+    assert {"work_status_asha", "work_allocation_asha", "work_available_python_developers",
+            "work_count_allocations"}.issubset({case["id"] for case in cases})
 
 
 def test_eval_exits_unsuccessfully_when_a_gold_section_is_missing(monkeypatch):
