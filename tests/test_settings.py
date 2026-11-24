@@ -15,6 +15,7 @@ def test_settings_defaults_preserve_existing_limits():
     assert settings.rerank_model == "cross-encoder/ms-marco-MiniLM-L-6-v2"
     assert settings.answer_table_max_rows == 50
     assert settings.max_message_length == 1000
+    assert settings.trace_log_questions is False
 
 
 def test_settings_read_all_supported_environment_overrides():
@@ -28,6 +29,7 @@ def test_settings_read_all_supported_environment_overrides():
         "RAG_RERANK_MODEL": "test/reranker",
         "RAG_TABLE_MAX_ROWS": "25",
         "RAG_MAX_MESSAGE_LENGTH": "1500",
+        "RAG_TRACE_LOG_QUESTIONS": "true",
     })
 
     assert settings.max_distance == 0.9
@@ -39,6 +41,7 @@ def test_settings_read_all_supported_environment_overrides():
     assert settings.rerank_model == "test/reranker"
     assert settings.answer_table_max_rows == 25
     assert settings.max_message_length == 1500
+    assert settings.trace_log_questions is True
 
 
 @pytest.mark.parametrize("name,value", [
@@ -51,6 +54,7 @@ def test_settings_read_all_supported_environment_overrides():
     ("RAG_RERANK_MODEL", " "),
     ("RAG_TABLE_MAX_ROWS", "0"),
     ("RAG_MAX_MESSAGE_LENGTH", "0"),
+    ("RAG_TRACE_LOG_QUESTIONS", "sometimes"),
 ])
 def test_settings_reject_invalid_environment_values(name, value):
     with pytest.raises(ValueError):

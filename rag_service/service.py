@@ -9,6 +9,7 @@ import re
 from .access import Principal
 from .pipeline import RagAnswer, answer_question
 from .settings import SETTINGS
+from .trace import request_trace
 
 CONVERSATION_TTL_SECONDS = 30 * 60
 UNAVAILABLE_REPLY = "The assistant is temporarily unavailable, please try again."
@@ -178,6 +179,14 @@ class RagService:
 
     def chat(self, conversation_id: str, message: str,
              principal: Principal) -> RagAnswer:
+        """Answer one chat request and include facade behavior in its trace."""
+        with request_trace(principal.role, message) as trace:
+            result = self._chat_impl(conversation_id, message, principal)
+            trace.set_result(result)
+            return result
+
+    def _chat_impl(self, conversation_id: str, message: str,
+                   principal: Principal) -> RagAnswer:
         """Answer a user message using only the history owned by that principal."""
         if not conversation_id:
             raise ValueError("A conversation id is required.")

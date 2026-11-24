@@ -27,6 +27,7 @@ from .people import (
     team_owner_query,
 )
 from .settings import SETTINGS
+from .trace import request_trace, stage as trace_stage
 
 MAX_HISTORY_TURNS = SETTINGS.history_turns
 MAX_TABLE_ROWS = SETTINGS.answer_table_max_rows
@@ -285,6 +286,24 @@ UNSUPPORTED_STRUCTURED_REPLY = (
 
 def answer_question(question: str, principal: Principal, llm, history=None, *,
                     vector_db=None, db_path=None, rerank=None) -> RagAnswer:
+    """Answer one question and emit a privacy-conscious structured trace event."""
+    with request_trace(principal.role, question) as trace:
+        with trace_stage("pipeline"):
+            result = _answer_question_impl(
+                question, principal, llm, history, vector_db=vector_db,
+                db_path=db_path, rerank=rerank)
+        trace.set_result(result)
+        return result
+
+
+def _trace_call(stage_name, function, *args, **kwargs):
+    """Measure a pipeline dependency call under its logical stage name."""
+    with trace_stage(stage_name):
+        return function(*args, **kwargs)
+
+
+def _answer_question_impl(question: str, principal: Principal, llm, history=None, *,
+                          vector_db=None, db_path=None, rerank=None) -> RagAnswer:
     """llm: callable(prompt) -> str.  history: [{'role': 'user'|'assistant', 'content': str}]."""
     kw_db = {"db_path": db_path} if db_path else {}
     sources = allowed_sources(principal.role)
@@ -292,7 +311,7 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
         return RagAnswer(NO_ACCESS_REPLY, "denied")
 
     if principal.role == ROLE_MANAGER and is_self_profile_query(question):
-        manager = find_own_manager(principal, **kw_db)
+        manager = _trace_call("sql", find_own_manager, principal, **kw_db)
         if manager:
             return RagAnswer(_manager_profile_reply(manager), "person", question,
                              [{"type": "sql", "query": "own manager profile", "rows": 1}])
@@ -303,7 +322,7 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
     if work_question:
         named_work, work_kind = parse_person_work_query(question)
         if named_work:
-            matches = find_person(named_work, principal,
+            matches = _trace_call("sql", find_person, named_work, principal,
                                   fuzzy=len(named_work.split()) >= 2 or "'s" in question or "’s" in question,
                                   **kw_db)
             employee_ids = [match["employee_id"] for match in matches]
@@ -316,13 +335,15 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
                                  f"mean?\n{choices}", "sql", question,
                                  [{"type": "sql", "query": "scoped person lookup",
                                    "rows": len(matches), "employee_ids": employee_ids}])
-            result = query_person_work_status(matches[0]["employee_id"], principal, **kw_db)
+            result = _trace_call(
+                "sql", query_person_work_status, matches[0]["employee_id"],
+                principal, **kw_db)
             if result.error:
                 return RagAnswer(UNSUPPORTED_STRUCTURED_REPLY, "sql", question)
             return RagAnswer(_person_work_reply(result, work_kind), "sql", question,
                              _work_sql_source(result, employee_ids), sql=result.sql)
 
-        result = query_workforce_status(question, principal, **kw_db)
+        result = _trace_call("sql", query_workforce_status, question, principal, **kw_db)
         if result.error:
             return RagAnswer(UNSUPPORTED_STRUCTURED_REPLY, "sql", question)
         employee_ids = _employee_id_list(result.columns, result.rows)
@@ -331,7 +352,7 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
 
     named_person, detail_kind = parse_person_detail_query(question)
     if named_person and "employee_db" in sources:
-        matches = find_person(named_person, principal,
+        matches = _trace_call("sql", find_person, named_person, principal,
                               fuzzy=len(named_person.split()) >= 2, **kw_db)
         if not matches:
             # Never broaden a named-person request to unrelated people in the caller's scope.
@@ -339,7 +360,8 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
                              "sql" if detail_kind == "skills" else "resumes", question)
         employee = matches[0]
         if detail_kind == "skills":
-            sql_result = query_person_skills(employee["employee_id"], principal, **kw_db)
+            sql_result = _trace_call(
+                "sql", query_person_skills, employee["employee_id"], principal, **kw_db)
             if not sql_result.rows:
                 return RagAnswer(_not_found(principal), "sql", question,
                                  sql=sql_result.sql, sql_error=sql_result.error)
@@ -352,7 +374,7 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
                                "rows": len(sql_result.rows),
                                "employee_ids": [employee["employee_id"]]}],
                              sql=sql_result.sql)
-        hits = search_resumes(
+        hits = _trace_call("retrieval", search_resumes,
             question, principal, k=max(SETTINGS.top_k, 100),
             restrict_ids={employee["employee_id"]}, use_distance_cutoff=False,
             vector_db=vector_db, rerank=rerank, **kw_db)
@@ -367,7 +389,7 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
                     f'<resume_excerpt employee="{person.employee_id}" '
                     f'name="{_scrub(person.name)}" section="{hit.section}">\n'
                     f'{_scrub(hit.text)}\n</resume_excerpt>')
-        answer = llm(ANSWER_PROMPT.format(
+        answer = _trace_call("llm", llm, ANSWER_PROMPT.format(
             role=principal.role.title(), question=question,
             context="RESUME EXCERPTS:\n" + "\n".join(excerpts))).strip()
         return RagAnswer(answer, "resumes", question,
@@ -381,7 +403,7 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
 
     manager_target = manager_of_query(question)
     if manager_target:
-        matches = find_person(manager_target, principal, **kw_db)
+        matches = _trace_call("sql", find_person, manager_target, principal, **kw_db)
         if not matches:
             scope = "your team's records" if principal.role == ROLE_MANAGER else "the records"
             return RagAnswer(
@@ -403,24 +425,26 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
     if candidate and (_basic_profile_intent(question) or _name_only_profile(question)):
         # typos are only forgiven for clear lookups ("who is X", or 2+ words), never for a bare
         # single word, so a skill like "python" cannot be mistaken for an employee "Peyton"
-        matches = find_person(candidate, principal,
+        matches = _trace_call("sql", find_person, candidate, principal,
                               fuzzy=explicit or len(candidate.split()) >= 2, **kw_db)
         if matches:
             return RagAnswer(_person_reply(matches, candidate, principal), "person", candidate,
                              [{"type": "sql", "query": "person lookup", "rows": len(matches),
                                "employee_ids": [m["employee_id"] for m in matches]}])
         if principal.role == ROLE_MANAGER:
-            manager = find_own_manager(principal, **kw_db)
+            manager = _trace_call("sql", find_own_manager, principal, **kw_db)
             if manager and name_matches(candidate, manager["name"]):
                 return RagAnswer(_manager_profile_reply(manager), "person", candidate,
                                  [{"type": "sql", "query": "own manager profile", "rows": 1}])
 
     standalone, route, person_name = _parse_route(
-        llm(ROUTER_PROMPT.format(history=_history_text(history), question=question)), question)
+        _trace_call("llm", llm,
+                    ROUTER_PROMPT.format(history=_history_text(history), question=question)),
+        question)
     if principal.role == ROLE_MANAGER:
         owner = team_owner_query(question)
         if owner:
-            manager = find_own_manager(principal, **kw_db)
+            manager = _trace_call("sql", find_own_manager, principal, **kw_db)
             if not manager or not name_matches(owner, manager["name"]):
                 return RagAnswer("I can only access your own team's records.",
                                  "denied", standalone)
@@ -434,7 +458,7 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
         detail_name, _ = parse_person_detail_query(standalone)
         name = person_name or detail_name
         if name:
-            matches = find_person(name, principal,
+            matches = _trace_call("sql", find_person, name, principal,
                                   fuzzy=len(name.split()) >= 2, **kw_db)
             if not matches:
                 return RagAnswer(_not_found(principal), "resumes", standalone)
@@ -445,7 +469,7 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
         if "employee_db" not in sources:
             return RagAnswer(NO_ACCESS_REPLY, "denied", standalone)
         name = person_name or standalone
-        matches = find_person(name, principal, **kw_db)
+        matches = _trace_call("sql", find_person, name, principal, **kw_db)
         return RagAnswer(_person_reply(matches, name, principal), "person", standalone,
                          [{"type": "sql", "query": "person lookup", "rows": len(matches),
                            "employee_ids": [m["employee_id"] for m in matches]}])
@@ -453,11 +477,11 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
     sql_result, hits, restrict = None, [], None
     if route in ("sql", "both") and "employee_db" in sources:
         structured_question = question if route == "both" else standalone
-        sql_result = query_workforce(
+        sql_result = _trace_call("sql", query_workforce,
             structured_question, principal, include_skill=route != "both", **kw_db)
         if (sql_result.error == "unsupported structured question" and
                 structured_question != question):
-            sql_result = query_workforce(question, principal,
+            sql_result = _trace_call("sql", query_workforce, question, principal,
                                          include_skill=route != "both", **kw_db)
         if route == "both":
             if sql_result.rows:
@@ -468,7 +492,7 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
         if not (route == "both" and restrict is not None and not restrict):
             if person_restrict is not None:
                 restrict = person_restrict
-            hits = search_resumes(
+            hits = _trace_call("retrieval", search_resumes,
                 standalone, principal, k=(max(SETTINGS.top_k, 100) if person_scoped
                                           else SETTINGS.top_k),
                 restrict_ids=restrict, use_distance_cutoff=not person_scoped,
@@ -498,7 +522,7 @@ def answer_question(question: str, principal: Principal, llm, history=None, *,
                               f'section="{h.section}">\n{_scrub(h.text)}\n</resume_excerpt>')
         parts.append("RESUME EXCERPTS:\n" + "\n".join(blocks))
 
-    text = llm(ANSWER_PROMPT.format(role=principal.role.title(), question=standalone,
+    text = _trace_call("llm", llm, ANSWER_PROMPT.format(role=principal.role.title(), question=standalone,
                                     context="\n\n".join(parts))).strip()
     srcs = []
     if has_sql:

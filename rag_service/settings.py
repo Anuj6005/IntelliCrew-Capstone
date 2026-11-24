@@ -48,6 +48,7 @@ class RagSettings:
     rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     answer_table_max_rows: int = 50
     max_message_length: int = 1000
+    trace_log_questions: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = None) -> "RagSettings":
@@ -68,6 +69,8 @@ class RagSettings:
                 env, "RAG_TABLE_MAX_ROWS", cls.answer_table_max_rows),
             max_message_length=_positive_int(
                 env, "RAG_MAX_MESSAGE_LENGTH", cls.max_message_length),
+            trace_log_questions=_boolean(
+                env, "RAG_TRACE_LOG_QUESTIONS", cls.trace_log_questions),
         )
 
 
